@@ -6,7 +6,7 @@ import logging
 import math
 import time
 from abc import ABC, abstractmethod
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -121,6 +121,27 @@ that's the highest you can go before you start decreasing concurrency.
 We use this heuristic over more sophisticated alternatives because a constant
 default is easy to reason about.
 """
+
+
+@dataclass(frozen=True)
+class AdditionalSplitBudget:
+    """A global budget of additional block boundaries across map tasks."""
+
+    additional_split_budget: int
+    num_tasks: int
+
+    def __post_init__(self) -> None:
+        assert self.additional_split_budget > 0
+        assert self.num_tasks > 0
+
+    def num_additional_splits_for_task(self, task_idx: int) -> int:
+        if not 0 <= task_idx < self.num_tasks:
+            return 0
+        base, remainder = divmod(
+            self.additional_split_budget,
+            self.num_tasks,
+        )
+        return base + (task_idx < remainder)
 
 
 def get_safe_default_logical_memory(ray_remote_args: Dict[str, Any]) -> int:
@@ -272,11 +293,8 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         # Keep track of all finished streaming generators.
         super().__init__(name, input_op, data_context, target_max_block_size_override)
 
-        # If set, then all output blocks will be split into
-        # this many sub-blocks. This is to avoid having
-        # too-large blocks, which may reduce parallelism for
-        # the subsequent operator.
-        self._additional_split_factor = None
+        # If set, additional block boundaries are distributed across map tasks.
+        self._additional_split_budget: Optional[AdditionalSplitBudget] = None
         # Callback functions that generate additional task kwargs
         # for the map task.
         self._map_task_kwargs_fns: List[Callable[[], Dict[str, Any]]] = []
@@ -338,19 +356,23 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             kwargs.update(fn())
         return kwargs
 
-    def get_additional_split_factor(self) -> int:
-        if self._additional_split_factor is None:
-            return 1
-        return self._additional_split_factor
+    def set_additional_split_budget(
+        self, additional_split_budget: AdditionalSplitBudget
+    ) -> None:
+        self._additional_split_budget = additional_split_budget
 
-    def set_additional_split_factor(self, k: int):
-        self._additional_split_factor = k
+    def has_additional_split_budget(self) -> bool:
+        return self._additional_split_budget is not None
 
     @property
     def name(self) -> str:
         name = super().name
-        if self._additional_split_factor is not None:
-            name += f"->SplitBlocks({self._additional_split_factor})"
+        if self._additional_split_budget is not None:
+            name += (
+                "->SplitBlocks("
+                f"additional={self._additional_split_budget.additional_split_budget}"
+                ")"
+            )
         return name
 
     @classmethod
@@ -500,15 +522,19 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             self._output_queue = FIFOBundleQueue()
 
         map_transformer = self._map_transformer
-        # Apply additional block split if needed.
-        if self.get_additional_split_factor() > 1:
-            split_factor = self.get_additional_split_factor()
+        # Apply each map task's share of the additional split budget after normal
+        # block shaping.
+        if self._additional_split_budget is not None:
+            additional_split_budget = self._additional_split_budget
             split_transformer = MapTransformer(
                 [
                     BlockMapTransformFn(
-                        lambda blocks, ctx: _split_blocks(blocks, split_factor),
-                        # NOTE: Disable block-shaping to avoid it overriding
-                        #       splitting
+                        lambda blocks, ctx: _apply_additional_split_budget(
+                            blocks,
+                            ctx,
+                            additional_split_budget,
+                        ),
+                        # Preserve the preceding transform's block shaping.
                         disable_block_shaping=True,
                     )
                 ]
@@ -944,7 +970,7 @@ def _splitrange(n, k):
     return output
 
 
-def _split_blocks(blocks: Iterable[Block], split_factor: float) -> Iterable[Block]:
+def _split_blocks(blocks: Iterable[Block], split_factor: int) -> Iterable[Block]:
     for block in blocks:
         block = BlockAccessor.for_block(block)
         offset = 0
@@ -954,6 +980,36 @@ def _split_blocks(blocks: Iterable[Block], split_factor: float) -> Iterable[Bloc
                 continue
             yield block.slice(offset, offset + size, copy=False)
             offset += size
+
+
+def _apply_additional_split_budget(
+    blocks: Iterable[Block],
+    ctx: TaskContext,
+    additional_split_budget: AdditionalSplitBudget,
+) -> Iterable[Block]:
+    """Consume this map task's share of the additional block-boundary budget.
+
+    Each nonempty natural block consumes as much of the remaining budget as its
+    row count allows. Once the budget is exhausted, subsequent natural blocks
+    pass through unchanged. Empty natural blocks are dropped, matching
+    ``_split_blocks``. The input is consumed one block at a time without
+    lookahead or materialization.
+    """
+    remaining_additional_splits = (
+        additional_split_budget.num_additional_splits_for_task(ctx.task_idx)
+    )
+    for block in blocks:
+        accessor = BlockAccessor.for_block(block)
+        block_num_rows = accessor.num_rows()
+        if block_num_rows == 0:
+            continue
+
+        num_splits = min(block_num_rows, 1 + remaining_additional_splits)
+        if num_splits == 1:
+            yield block
+        else:
+            yield from _split_blocks([block], num_splits)
+            remaining_additional_splits -= num_splits - 1
 
 
 def _wrap_transformer_with_limit(

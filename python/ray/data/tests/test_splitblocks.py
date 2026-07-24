@@ -3,11 +3,16 @@ import pyarrow as pa
 import pytest
 
 import ray
+from ray.data._internal.execution.interfaces.task_context import TaskContext
 from ray.data._internal.execution.operators.map_operator import (
+    AdditionalSplitBudget,
+    _apply_additional_split_budget,
     _split_blocks,
     _splitrange,
 )
-from ray.data.block import BlockAccessor
+from ray.data.block import BlockAccessor, BlockMetadata
+from ray.data.datasource import Datasource
+from ray.data.datasource.datasource import ReadTask
 from ray.data.tests.conftest import *  # noqa
 from ray.data.tests.conftest import (
     CoreExecutionMetrics,
@@ -53,6 +58,236 @@ def test_split_blocks():
     f(50, 5)
 
 
+def _block_sizes(blocks):
+    return [BlockAccessor.for_block(block).num_rows() for block in blocks]
+
+
+def _task_ctx(task_idx):
+    return TaskContext(task_idx=task_idx, op_name="Read")
+
+
+def _additional_split_budget(
+    additional_split_budget,
+    num_tasks=1,
+):
+    return AdditionalSplitBudget(
+        additional_split_budget,
+        num_tasks,
+    )
+
+
+class _UnderestimatedMultiBlockDatasource(Datasource):
+    """Two read tasks whose runtime blocks are larger than their metadata estimate."""
+
+    def __init__(self, blocks_per_task):
+        self._blocks_per_task = blocks_per_task
+
+    def estimate_inmemory_data_size(self):
+        # Deliberately underestimate runtime bytes so the optimizer installs an
+        # additional split budget.
+        return 2
+
+    def get_read_tasks(
+        self,
+        parallelism,
+        per_task_row_limit=None,
+        data_context=None,
+    ):
+        tasks = []
+        blocks_per_task = self._blocks_per_task
+        for task_idx in range(2):
+
+            def read_fn(task_idx=task_idx, blocks_per_task=blocks_per_task):
+                for block_idx in range(blocks_per_task):
+                    start = 10 * (task_idx * blocks_per_task + block_idx)
+                    yield pa.table({"value": range(start, start + 10)})
+
+            tasks.append(
+                ReadTask(
+                    read_fn,
+                    BlockMetadata(
+                        num_rows=blocks_per_task * 10,
+                        # Deliberately underestimate runtime bytes so the
+                        # optimizer installs an additional split budget.
+                        size_bytes=1,
+                        input_files=None,
+                        exec_stats=None,
+                    ),
+                    per_task_row_limit=per_task_row_limit,
+                )
+            )
+        return tasks
+
+
+@pytest.mark.parametrize(
+    "blocks_per_task,override_num_blocks,expected_block_sizes",
+    [
+        (1, 6, [3, 3, 3, 3, 4, 4]),
+        (3, 4, [5, 5, 5, 5, 10, 10, 10, 10]),
+    ],
+    ids=[
+        "one-block-reads-hit-target",
+        "natural-fanout-adds-only-budget",
+    ],
+)
+def test_additional_split_budget_e2e(
+    ray_start_10_cpus_shared,
+    restore_data_context,
+    blocks_per_task,
+    override_num_blocks,
+    expected_block_sizes,
+):
+    # Each Arrow block contains 80 data bytes. A 64-byte target shapes every
+    # yielded datasource block into a separate natural runtime block.
+    ray.data.DataContext.get_current().target_max_block_size = 64
+
+    ds = ray.data.read_datasource(
+        _UnderestimatedMultiBlockDatasource(blocks_per_task),
+        override_num_blocks=override_num_blocks,
+    ).materialize()
+    blocks = ray.get(ds.get_internal_block_refs())
+
+    assert sorted(_block_sizes(blocks)) == expected_block_sizes
+    assert ds.count() == blocks_per_task * 2 * 10
+
+
+def test_additional_split_budget_one_block_exact():
+    output = list(
+        _apply_additional_split_budget(
+            [pa.table({"value": range(10)})],
+            _task_ctx(0),
+            _additional_split_budget(
+                additional_split_budget=4,
+            ),
+        )
+    )
+
+    assert _block_sizes(output) == [2, 2, 2, 2, 2]
+
+
+def test_additional_split_budget_is_bounded():
+    blocks = [pa.table({"value": range(i * 10, (i + 1) * 10)}) for i in range(3)]
+    output = list(
+        _apply_additional_split_budget(
+            blocks,
+            _task_ctx(0),
+            _additional_split_budget(
+                additional_split_budget=2,
+            ),
+        )
+    )
+
+    assert _block_sizes(output) == [4, 3, 3, 10, 10]
+    assert output[-2] is blocks[-2]
+    assert output[-1] is blocks[-1]
+
+
+def test_additional_split_budget_tiny_blocks():
+    output = list(
+        _apply_additional_split_budget(
+            [
+                pa.table({"value": [0, 1]}),
+                pa.table({"value": [2]}),
+            ],
+            _task_ctx(0),
+            _additional_split_budget(
+                additional_split_budget=5,
+            ),
+        )
+    )
+
+    assert _block_sizes(output) == [1, 1, 1]
+
+
+def test_additional_split_budget_drops_natural_empty_blocks():
+    output = list(
+        _apply_additional_split_budget(
+            [
+                pa.table({"value": []}),
+                pa.table({"value": range(4)}),
+                pa.table({"value": []}),
+            ],
+            _task_ctx(0),
+            _additional_split_budget(
+                additional_split_budget=2,
+            ),
+        )
+    )
+
+    assert _block_sizes(output) == [2, 1, 1]
+
+
+def test_additional_split_budget_distributes_across_tasks():
+    budget = _additional_split_budget(
+        additional_split_budget=5,
+        num_tasks=2,
+    )
+    outputs = [
+        list(
+            _apply_additional_split_budget(
+                [pa.table({"value": range(task_idx * 8, (task_idx + 1) * 8)})],
+                _task_ctx(task_idx),
+                budget,
+            )
+        )
+        for task_idx in range(2)
+    ]
+
+    assert [_block_sizes(output) for output in outputs] == [
+        [2, 2, 2, 2],
+        [3, 3, 2],
+    ]
+
+
+def test_additional_split_budget_ignores_unplanned_task():
+    block = pa.table({"value": range(8)})
+
+    output = list(
+        _apply_additional_split_budget(
+            [block],
+            _task_ctx(2),
+            _additional_split_budget(
+                additional_split_budget=5,
+                num_tasks=2,
+            ),
+        )
+    )
+
+    assert len(output) == 1
+    assert output[0] is block
+
+
+def test_additional_split_budget_does_not_look_ahead():
+    blocks = [
+        pa.table({"value": [0, 1, 2, 3]}),
+        pa.table({"value": [4]}),
+    ]
+    num_consumed = 0
+
+    def iter_blocks():
+        nonlocal num_consumed
+        for block in blocks:
+            num_consumed += 1
+            yield block
+
+    output = iter(
+        _apply_additional_split_budget(
+            iter_blocks(),
+            _task_ctx(0),
+            _additional_split_budget(
+                additional_split_budget=1,
+            ),
+        )
+    )
+
+    # The current natural block is yielded before requesting its successor.
+    assert _block_sizes([next(output)]) == [2]
+    assert num_consumed == 1
+    assert _block_sizes([next(output)]) == [2]
+    assert num_consumed == 1
+    assert next(output) is blocks[1]
+
+
 def test_small_file_split(ray_start_10_cpus_shared, restore_data_context):
     last_snapshot = get_initial_core_execution_metrics_snapshot()
 
@@ -92,7 +327,7 @@ def test_small_file_split(ray_start_10_cpus_shared, restore_data_context):
         CoreExecutionMetrics(
             task_count={
                 "MapBatches(<lambda>)": 10,
-                "ReadCSV->SplitBlocks(10)": 1,
+                "ReadCSV->SplitBlocks(additional=9)": 1,
             },
         ),
         last_snapshot,
@@ -102,7 +337,7 @@ def test_small_file_split(ray_start_10_cpus_shared, restore_data_context):
     last_snapshot = assert_core_execution_metrics_equals(
         CoreExecutionMetrics(
             task_count={
-                "ReadCSV->SplitBlocks(10)": 1,
+                "ReadCSV->SplitBlocks(additional=9)": 1,
             },
         ),
         last_snapshot,
@@ -118,7 +353,7 @@ def test_small_file_split(ray_start_10_cpus_shared, restore_data_context):
 
     ds = ds.map_batches(lambda x: x).materialize()
     stats = ds.stats()
-    assert "Operator 1 ReadCSV->SplitBlocks(100)" in stats, stats
+    assert "Operator 1 ReadCSV->SplitBlocks(additional=99)" in stats, stats
     assert "Operator 2 MapBatches" in stats, stats
 
     # Smaller than a single row.
@@ -129,7 +364,7 @@ def test_small_file_split(ray_start_10_cpus_shared, restore_data_context):
     print(ds.stats())
 
 
-def test_large_file_additional_split(ray_start_10_cpus_shared, tmp_path):
+def test_large_file_additional_split_budget(ray_start_10_cpus_shared, tmp_path):
     ctx = ray.data.context.DataContext.get_current()
     if ctx.use_datasource_v2:
         pytest.skip(
