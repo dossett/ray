@@ -1994,10 +1994,9 @@ def test_max_block_size_none_respects_override_num_blocks(
     """
     if ray.data.DataContext.get_current().use_datasource_v2:
         pytest.skip(
-            "DataSourceV2 does not support per-read-task block splitting for "
-            "``override_num_blocks`` on single-file inputs. V1's "
-            "``compute_additional_split_factor`` has no V2 equivalent "
-            "(confirmed absent in the proprietary engine as well)."
+            "DataSourceV2 uses its separate bucket and size-bound read path. It "
+            "does not use V1's per-task split multiplier and therefore does not "
+            "exercise the multiplier regression covered by this test."
         )
     import os
 

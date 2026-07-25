@@ -10,7 +10,10 @@ import ray
 if TYPE_CHECKING:
     from ray.data.context import DataContext
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
-from ray.data._internal.execution.operators.map_operator import MapOperator
+from ray.data._internal.execution.operators.map_operator import (
+    AdditionalSplitBudget,
+    MapOperator,
+)
 from ray.data._internal.execution.operators.task_pool_map_operator import (
     TaskPoolMapOperator,
 )
@@ -25,8 +28,10 @@ from ray.data._internal.logical.operators import (
     MapBatches,
     MapRows,
     Project,
+    Read,
 )
 from ray.data._internal.logical.optimizers import PhysicalOptimizer
+from ray.data._internal.logical.rules import compute_read_parallelism
 from ray.data._internal.planner import create_planner
 from ray.data.block import BlockMetadata
 from ray.data.context import DataContext
@@ -95,11 +100,13 @@ def test_split_blocks_operator(ray_start_regular_shared_2_cpus):
     physical_plan = PhysicalOptimizer().optimize(physical_plan)
     physical_op = physical_plan.dag
 
-    assert physical_op.name == "ReadParquet->SplitBlocks(10)"
+    assert physical_op.name == "ReadParquet->SplitBlocks(additional=9)"
     assert isinstance(physical_op, MapOperator)
     assert len(physical_op.input_dependencies) == 1
     assert isinstance(physical_op.input_dependencies[0], InputDataBuffer)
-    assert physical_op._additional_split_factor == 10
+    split_budget = physical_op._additional_split_budget
+    assert split_budget.additional_split_budget == 9
+    assert split_budget.num_tasks == 1
 
     # Test that split blocks prevents fusion.
     op = MapBatches(
@@ -114,7 +121,107 @@ def test_split_blocks_operator(ray_start_regular_shared_2_cpus):
     assert len(physical_op.input_dependencies) == 1
     up_physical_op = physical_op.input_dependencies[0]
     assert isinstance(up_physical_op, MapOperator)
-    assert up_physical_op.name == "ReadParquet->SplitBlocks(10)"
+    assert up_physical_op.name == "ReadParquet->SplitBlocks(additional=9)"
+
+
+def test_read_task_planning_execution_argument_parity(
+    ray_start_regular_shared_2_cpus,
+):
+    class RecordingDatasource(Datasource):
+        def __init__(self):
+            self.calls = []
+
+        def estimate_inmemory_data_size(self):
+            return 2
+
+        def get_read_tasks(
+            self,
+            parallelism,
+            per_task_row_limit=None,
+            data_context=None,
+        ):
+            self.calls.append((parallelism, per_task_row_limit, data_context))
+            return [
+                ReadTask(
+                    lambda task_idx=task_idx: [pd.DataFrame({"value": [task_idx]})],
+                    BlockMetadata(10, 1, None, None),
+                    per_task_row_limit=per_task_row_limit,
+                )
+                for task_idx in range(2)
+            ]
+
+    ctx = DataContext.get_current()
+    datasource = RecordingDatasource()
+    read_op = Read(
+        datasource=datasource,
+        datasource_or_legacy_reader=datasource,
+        parallelism=6,
+        per_block_limit=7,
+    )
+    logical_plan = LogicalPlan(read_op, ctx)
+    physical_plan, _ = create_planner().plan(logical_plan)
+    physical_plan = PhysicalOptimizer().optimize(physical_plan)
+
+    physical_op = physical_plan.dag
+    split_budget = physical_op._additional_split_budget
+    assert split_budget.additional_split_budget == 4
+    assert split_budget.num_tasks == 2
+    input_op = physical_op.input_dependencies[0]
+    input_op._input_data_factory(ctx.target_max_block_size)
+
+    calls_with_limit = [call for call in datasource.calls if call[1] == 7]
+    assert len(calls_with_limit) == 2
+    planning_call, execution_call = calls_with_limit
+    assert planning_call[:2] == execution_call[:2] == (6, 7)
+    assert planning_call[2] is execution_call[2] is ctx
+
+
+def test_compute_read_parallelism_empty_and_unknown_size_edges(
+    ray_start_regular_shared_2_cpus,
+):
+    class FixedTaskCountDatasource(Datasource):
+        def __init__(self, num_tasks):
+            self.num_tasks = num_tasks
+
+        def estimate_inmemory_data_size(self):
+            return None
+
+        def get_read_tasks(
+            self,
+            parallelism,
+            per_task_row_limit=None,
+            data_context=None,
+        ):
+            return [
+                ReadTask(
+                    lambda: [],
+                    BlockMetadata(None, None, None, None),
+                )
+                for _ in range(self.num_tasks)
+            ]
+
+    ctx = DataContext.get_current()
+    empty_decision = compute_read_parallelism(
+        FixedTaskCountDatasource(0),
+        parallelism=4,
+        mem_size=100,
+        target_max_block_size=10,
+        per_task_row_limit=None,
+        data_context=ctx,
+    )
+    assert empty_decision.estimated_num_blocks == 0
+    assert empty_decision.additional_split_budget is None
+
+    unknown_size_decision = compute_read_parallelism(
+        FixedTaskCountDatasource(2),
+        parallelism=4,
+        mem_size=None,
+        target_max_block_size=10,
+        per_task_row_limit=None,
+        data_context=ctx,
+    )
+    assert unknown_size_decision.estimated_num_blocks == 4
+    assert unknown_size_decision.additional_split_budget == AdditionalSplitBudget(2, 2)
 
 
 def test_from_operators(ray_start_regular_shared_2_cpus):

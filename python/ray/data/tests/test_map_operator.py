@@ -18,6 +18,7 @@ from ray.data._internal.execution.operators.actor_pool_map_operator import (
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.execution.operators.map_operator import (
+    AdditionalSplitBudget,
     MapOperator,
 )
 from ray.data._internal.execution.operators.task_pool_map_operator import (
@@ -52,6 +53,7 @@ def _run_map_operator_test(
     output_block_size_option,
     expected_blocks,
     test_name="TestMapper",
+    additional_split_budget=None,
 ):
     """Shared test function for MapOperator output unbundling tests."""
     # Create with inputs.
@@ -74,6 +76,8 @@ def _run_map_operator_test(
         # Send everything in a single bundle of 10 blocks.
         min_rows_per_bundle=10,
     )
+    if additional_split_budget is not None:
+        op.set_additional_split_budget(additional_split_budget)
 
     # Feed data and block on exec.
     op.start(ExecutionOptions(preserve_order=preserve_order), noop_counter())
@@ -290,6 +294,25 @@ def test_map_operator_output_unbundling(
         noop,
         OutputBlockSizeOption.of(target_max_block_size=target_max_block_size),
         num_expected_blocks,
+    )
+
+
+@pytest.mark.parametrize("preserve_order", [False, True])
+def test_additional_split_budget_preserves_target_max_block_size(
+    ray_start_regular_shared,
+    preserve_order,
+):
+    def noop(block_iter: Iterable[Block], ctx) -> Iterable[Block]:
+        yield from block_iter
+
+    _run_map_operator_test(
+        ray_start_regular_shared,
+        use_actors=False,
+        preserve_order=preserve_order,
+        transform_fn=noop,
+        output_block_size_option=OutputBlockSizeOption.of(target_max_block_size=1),
+        expected_blocks=10,
+        additional_split_budget=AdditionalSplitBudget(1, 1),
     )
 
 
@@ -596,8 +619,8 @@ def test_map_estimated_num_output_bundles(
     assert op._estimated_num_output_bundles == expected_num_outputs_per_task * num_tasks
 
 
-def test_map_estimated_blocks_split():
-    # Test read output splitting
+def test_map_estimated_blocks_with_additional_split_budget():
+    # Test that an additional split budget doesn't multiply natural blocks.
 
     min_rows_per_bundle = 10
     input_op = InputDataBuffer(
@@ -623,7 +646,7 @@ def test_map_estimated_blocks_split():
         name="TestEstimatedNumBlocksSplit",
         min_rows_per_bundle=min_rows_per_bundle,
     )
-    op.set_additional_split_factor(2)
+    op.set_additional_split_budget(AdditionalSplitBudget(10, 10))
 
     op.start(ExecutionOptions(), noop_counter())
     while input_op.has_next():
@@ -634,7 +657,7 @@ def test_map_estimated_blocks_split():
             assert op._estimated_num_output_bundles == 100
 
     op.all_inputs_done()
-    # Each output block is split in 2, so the number of blocks double.
+    # One-row natural blocks cannot consume any additional split boundaries.
     assert op._estimated_num_output_bundles == 100
 
 

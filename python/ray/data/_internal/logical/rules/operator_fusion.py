@@ -301,7 +301,7 @@ class FuseOperators(Rule):
         down_logical_op = self._op_map[down_op]
         up_logical_op = self._op_map[up_op]
 
-        if up_op.get_additional_split_factor() > 1:
+        if up_op.has_additional_split_budget():
             return False
 
         # If the downstream operator takes no input, it cannot be fused with

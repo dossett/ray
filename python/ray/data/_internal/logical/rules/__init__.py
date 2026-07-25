@@ -13,8 +13,9 @@ from .predicate_pushdown import PredicatePushdown
 from .projection_pushdown import ProjectionPushdown
 from .pushdown_count_files import PushdownCountFiles
 from .set_read_parallelism import (
+    ReadParallelismDecision,
     SetReadParallelismRule,
-    compute_additional_split_factor,
+    compute_read_parallelism,
 )
 
 __all__ = [
@@ -28,7 +29,8 @@ __all__ = [
     "PredicatePushdown",
     "ProjectionPushdown",
     "PushdownCountFiles",
+    "ReadParallelismDecision",
     "SetReadParallelismRule",
     "are_remote_args_compatible",
-    "compute_additional_split_factor",
+    "compute_read_parallelism",
 ]
